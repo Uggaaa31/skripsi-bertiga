@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import math
@@ -30,11 +31,21 @@ INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "sensor_data")
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN")
 INFLUX_STARTUP_RETRIES = int(os.getenv("INFLUX_STARTUP_RETRIES", "30"))
 INFLUX_STARTUP_DELAY_SEC = float(os.getenv("INFLUX_STARTUP_DELAY_SEC", "2"))
+MEASUREMENT_MODE = os.getenv("MEASUREMENT_MODE", "full_topic").lower()
+FIELD_TYPE_SUFFIX = os.getenv("FIELD_TYPE_SUFFIX", "true").lower() in {"1", "true", "yes", "on"}
+STORE_BINARY_AS_BASE64 = os.getenv("STORE_BINARY_AS_BASE64", "true").lower() in {"1", "true", "yes", "on"}
 
 
 def sanitize_key(value: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_")
-    return sanitized or "unknown"
+    sanitized = sanitized or "unknown"
+    if sanitized.lower() == "time":
+        sanitized = "time_value"
+    if sanitized.startswith("_"):
+        sanitized = f"f{sanitized}"
+    if sanitized[0].isdigit():
+        sanitized = f"f_{sanitized}"
+    return sanitized
 
 
 def flatten_payload(value, prefix="", output=None):
@@ -104,8 +115,9 @@ def measurement_from_topic(topic: str) -> str:
     segments = [sanitize_key(part) for part in topic.split("/") if part]
     if not segments:
         return "mqtt"
-    # Use only the first segment as measurement name to group related data
-    return segments[0]
+    if MEASUREMENT_MODE == "first_topic_level":
+        return segments[0]
+    return "_".join(segments)
 
 
 def tags_from_topic(topic: str, fields: dict) -> dict:
@@ -123,6 +135,47 @@ def tags_from_topic(topic: str, fields: dict) -> dict:
     return tags
 
 
+def field_type_suffix(value) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "bin"
+    return "str"
+
+
+def normalize_field_value(value):
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        if not STORE_BINARY_AS_BASE64:
+            return None
+        return base64.b64encode(bytes(value)).decode("ascii")
+
+    # Fallback for unknown scalar types.
+    return str(value)
+
+
 def build_point(topic: str, payload: dict):
     fields = flatten_payload(payload)
     event_time = extract_event_time(fields)
@@ -136,31 +189,16 @@ def build_point(topic: str, payload: dict):
 
     field_count = 0
     for field_key, field_value in fields.items():
-        if field_value is None:
+        normalized_value = normalize_field_value(field_value)
+        if normalized_value is None:
             continue
 
         sanitized_key = sanitize_key(field_key)
+        if FIELD_TYPE_SUFFIX:
+            sanitized_key = f"{sanitized_key}__{field_type_suffix(field_value)}"
 
-        if isinstance(field_value, bool):
-            point.field(sanitized_key, field_value)
-            field_count += 1
-            continue
-
-        if isinstance(field_value, int):
-            point.field(sanitized_key, field_value)
-            field_count += 1
-            continue
-
-        if isinstance(field_value, float):
-            if math.isnan(field_value) or math.isinf(field_value):
-                continue
-            point.field(sanitized_key, field_value)
-            field_count += 1
-            continue
-
-        if isinstance(field_value, str):
-            point.field(sanitized_key, field_value)
-            field_count += 1
+        point.field(sanitized_key, normalized_value)
+        field_count += 1
 
     if field_count == 0:
         return None
@@ -222,22 +260,36 @@ def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
 
 
 def on_message(client, userdata, message):
-    payload_text = message.payload.decode("utf-8", errors="replace").strip()
     logging.info("Received MQTT message on topic: %s", message.topic)
 
-    if not payload_text:
+    payload_bytes = bytes(message.payload)
+    if not payload_bytes:
         logging.warning("Skipping empty payload on topic %s", message.topic)
         return
 
     if message.topic.startswith("$SYS/"):
         return
 
+    payload_text = None
     try:
-        payload = json.loads(payload_text)
-    except json.JSONDecodeError:
-        # If not JSON, treat as raw data to ensure nothing is lost
-        logging.info("Non-JSON payload on topic %s, storing as raw_data", message.topic)
-        payload = {"raw_data": payload_text}
+        payload_text = payload_bytes.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        payload = {
+            "raw_binary_b64": base64.b64encode(payload_bytes).decode("ascii"),
+            "raw_binary_len": len(payload_bytes),
+            "payload_format": "binary_base64",
+        }
+    else:
+        if not payload_text:
+            logging.warning("Skipping empty UTF-8 payload on topic %s", message.topic)
+            return
+
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            # If not JSON, treat as raw data to ensure nothing is lost
+            logging.info("Non-JSON payload on topic %s, storing as raw_data", message.topic)
+            payload = {"raw_data": payload_text, "payload_format": "raw_text"}
 
     if not isinstance(payload, dict):
         payload = {"value": payload}

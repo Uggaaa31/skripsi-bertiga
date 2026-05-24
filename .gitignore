@@ -2,6 +2,7 @@
 
 # Runtime/persistent data
 influxdb_data/
+grafana_data/
 mosquitto/data/
 mosquitto/log/
 
