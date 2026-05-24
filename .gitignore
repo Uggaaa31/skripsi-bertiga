@@ -1,0 +1,10 @@
+.env
+
+# Runtime/persistent data
+influxdb_data/
+mosquitto/data/
+mosquitto/log/
+
+# Python cache
+mqtt_influx_bridge/__pycache__/
+*.pyc

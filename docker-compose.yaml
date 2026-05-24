@@ -1,0 +1,63 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.1.2
+    container_name: mosquitto
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+    ports:
+      - "1883:1883"   # MQTT Standar
+      - "9001:9001"   # MQTT Websocket
+    restart: unless-stopped
+
+  influxdb:
+    image: influxdb:2.7
+    container_name: influxdb
+    ports:
+      - "8086:8086"
+    volumes:
+      - ./influxdb_data:/var/lib/influxdb2
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=${INFLUXDB_INIT_USERNAME:-admin}
+      - DOCKER_INFLUXDB_INIT_PASSWORD=${INFLUXDB_INIT_PASSWORD:-CHANGE_ME}
+      - DOCKER_INFLUXDB_INIT_ORG=${INFLUX_ORG:-ta_org}
+      - DOCKER_INFLUXDB_INIT_BUCKET=${INFLUX_BUCKET:-sensor_data}
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUXDB_ADMIN_TOKEN:-TA_SENSOR_DATA_TOKEN_CHANGE_ME}
+    healthcheck:
+      test: ["CMD", "influx", "ping", "--host", "http://localhost:8086"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  mqtt-influx-bridge:
+    build:
+      context: ./mqtt_influx_bridge
+    container_name: mqtt-influx-bridge
+    depends_on:
+      mosquitto:
+        condition: service_started
+      influxdb:
+        condition: service_healthy
+    environment:
+      - MQTT_HOST=${MQTT_HOST:-mosquitto}
+      - MQTT_PORT=${MQTT_PORT:-1883}
+      - MQTT_TOPIC=${MQTT_TOPIC:-#}
+      - MQTT_TRANSPORT=${MQTT_TRANSPORT:-tcp}
+      - INFLUX_URL=${INFLUX_URL:-http://influxdb:8086}
+      - INFLUX_ORG=${INFLUX_ORG:-ta_org}
+      - INFLUX_BUCKET=${INFLUX_BUCKET:-sensor_data}
+      - INFLUX_TOKEN=${INFLUXDB_ADMIN_TOKEN:-TA_SENSOR_DATA_TOKEN_CHANGE_ME}
+      - LOG_LEVEL=${BRIDGE_LOG_LEVEL:-INFO}
+      - INFLUX_STARTUP_RETRIES=${INFLUX_STARTUP_RETRIES:-30}
+      - INFLUX_STARTUP_DELAY_SEC=${INFLUX_STARTUP_DELAY_SEC:-2}
+    restart: unless-stopped
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared-tunnel
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    restart: unless-stopped
